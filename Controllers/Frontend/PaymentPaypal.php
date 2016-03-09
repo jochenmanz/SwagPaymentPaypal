@@ -111,7 +111,7 @@ class Shopware_Controllers_Frontend_PaymentPaypal extends Shopware_Controllers_F
 
         $logoImage = $config->get('paypalLogoImage');
         if ($this->plugin->isShopware51()) {
-            /** @var \Shopware\Bundle\MediaBundle\MediaService $mediaService */
+            /** @var \Shopware\Bundle\StoreFrontBundle\Service\Core\MediaService $mediaService */
             $mediaService = $this->get('shopware_media.media_service');
             $logoImage = $mediaService->getUrl($logoImage);
         }
@@ -156,8 +156,8 @@ class Shopware_Controllers_Frontend_PaymentPaypal extends Shopware_Controllers_F
             $params['IDENTITYACCESSTOKEN'] = $this->session->PaypalAuth['access_token'];
         }
 
-        $params = array_merge($params, $this->getBasketParameter());
-        $params = array_merge($params, $this->getCustomerParameter());
+        $params = array_merge($params, $this->getBasketParameter('PAYMENTREQUEST_0_'));
+        $params = array_merge($params, $this->getCustomerParameter('PAYMENTREQUEST_0_SHIPTO'));
 
         $response = $client->setExpressCheckout($params);
 
@@ -448,66 +448,22 @@ class Shopware_Controllers_Frontend_PaymentPaypal extends Shopware_Controllers_F
     protected function finishCheckout($details)
     {
         $client = $client = $this->get('paypalClient');
-        $config = $this->plugin->Config();
-
-        $router = $this->Front()->Router();
-        $notifyUrl = $router->assemble(array('action' => 'notify', 'forceSecure' => true, 'appendSession' => true));
 
         if (!empty($details['REFERENCEID'])) {
-            $params = array(
-                'REFERENCEID' => $details['REFERENCEID'],
-                'IPADDRESS' => $this->Request()->getClientIp(false),
-                'PAYMENTREQUEST_0_NOTIFYURL' => $notifyUrl,
-                'PAYMENTREQUEST_0_CUSTOM' => $this->createPaymentUniqueId(),
-                'BUTTONSOURCE' => 'Shopware_Cart_ECM'
-            );
-        } else {
-            $params = array(
-                'TOKEN' => $details['TOKEN'],
-                'PAYERID' => $details['PAYERID'],
-                'PAYMENTREQUEST_0_NOTIFYURL' => $notifyUrl,
-                'PAYMENTREQUEST_0_CUSTOM' => $details['PAYMENTREQUEST_0_CUSTOM'],
-                'BUTTONSOURCE' => 'Shopware_Cart_ECS'
-            );
-        }
+            $params = $this->getReferenceTransactionParams($details);
 
-        if (Shopware::VERSION == '___VERSION___' || version_compare(Shopware::VERSION, '4.4.0') >= 0) {
-            $params['BUTTONSOURCE'] = 'Shopware_Cart_5';
-        }
-
-        if (empty($params['TOKEN'])) {
-            $params['PAYMENTREQUEST_0_PAYMENTACTION'] = 'Authorization';
-        } else {
-            $params['PAYMENTREQUEST_0_PAYMENTACTION'] = $config->get('paypalPaymentAction', 'Sale');
-        }
-
-        $params = array_merge($params, $this->getBasketParameter());
-        $params = array_merge($params, $this->getCustomerParameter());
-
-        if ($config->get('paypalSendInvoiceId')) {
-            $orderNumber = $this->saveOrder(
-                isset($params['TOKEN']) ? $params['TOKEN'] : $params['REFERENCEID'],
-                $params['PAYMENTREQUEST_0_CUSTOM']
-            );
-            $prefix = $config->get('paypalPrefixInvoiceId');
-            if (!empty($prefix)) {
-                // Set prefixed invoice id - Remove special chars and spaces
-                $prefix = str_replace(' ', '', $prefix);
-                $prefix = preg_replace('/[^A-Za-z0-9\-]/', '', $prefix);
-                $params['PAYMENTREQUEST_0_INVNUM'] = $prefix . $orderNumber;
-            } else {
-                $params['PAYMENTREQUEST_0_INVNUM'] = $orderNumber;
-            }
-        }
-
-        //$params['SOFTDESCRIPTOR'] = $orderNumber;
-
-        if (!empty($params['REFERENCEID'])) {
             $result = $client->doReferenceTransaction($params);
+
+            $result['PAYMENTREQUEST_0_CUSTOM'] = $params['CUSTOM'];
+            $result['PAYMENTINFO_0_TRANSACTIONID'] = $result['TRANSACTIONID'];
+            $result['PAYMENTINFO_0_AMT'] = $result['AMT'];
         } else {
+            $params = $this->getExpressCheckoutPaymentParams($details);
+
             $result = $client->doExpressCheckoutPayment($params);
+
+            $result['PAYMENTREQUEST_0_CUSTOM'] = $params['PAYMENTREQUEST_0_CUSTOM'];
         }
-        $result['PAYMENTREQUEST_0_CUSTOM'] = $params['PAYMENTREQUEST_0_CUSTOM'];
 
         if ($result['ACK'] != 'Success') {
             return $result;
@@ -566,7 +522,7 @@ class Shopware_Controllers_Frontend_PaymentPaypal extends Shopware_Controllers_F
 
         // Sets payment status
         $paymentStatus = $result['PAYMENTINFO_0_PAYMENTSTATUS'];
-        $ppAmount = floatval($result['PAYMENTINFO_0_AMT']);
+        $ppAmount = (float)$result['PAYMENTINFO_0_AMT'];
         $swAmount = $this->getAmount();
         if (abs($swAmount - $ppAmount) >= 0.01) {
             $paymentStatus = 'AmountMissMatch'; //Überprüfung notwendig
@@ -698,41 +654,43 @@ class Shopware_Controllers_Frontend_PaymentPaypal extends Shopware_Controllers_F
     /**
      * Returns the article list parameter data.
      *
+     * @param string $prefix
+     *
      * @return array
      */
-    protected function getBasketParameter()
+    protected function getBasketParameter($prefix = '')
     {
         $params = array();
         $user = $this->getUser();
 
-        $params['PAYMENTREQUEST_0_CURRENCYCODE'] = $this->getCurrencyShortName();
+        $params[$prefix . 'CURRENCYCODE'] = $this->getCurrencyShortName();
 
         if ($user !== null) {
             $basket = $this->getBasket();
             if (!empty($basket['sShippingcosts'])) {
-                $params['PAYMENTREQUEST_0_SHIPPINGAMT'] = $this->getShipment();
+                $params[$prefix . 'SHIPPINGAMT'] = $this->getShipment();
             }
-            $params['PAYMENTREQUEST_0_AMT'] = $this->getAmount();
+            $params[$prefix . 'AMT'] = $this->getAmount();
         } else {
             $basket = $this->get('modules')->Basket()->sGetBasket();
             if (!empty($basket['sShippingcosts'])) {
-                $params['PAYMENTREQUEST_0_SHIPPINGAMT'] = !empty($basket['sShippingcostsWithTax']) ? $basket['sShippingcostsWithTax'] : $basket['sShippingcosts'];
-                $params['PAYMENTREQUEST_0_SHIPPINGAMT'] = str_replace(',', '.', $params['PAYMENTREQUEST_0_SHIPPINGAMT']);
+                $params[$prefix . 'SHIPPINGAMT'] = !empty($basket['sShippingcostsWithTax']) ? $basket['sShippingcostsWithTax'] : $basket['sShippingcosts'];
+                $params[$prefix . 'SHIPPINGAMT'] = str_replace(',', '.', $params[$prefix . 'SHIPPINGAMT']);
             }
             if (!empty($user['additional']['charge_vat']) && !empty($item['AmountWithTaxNumeric'])) {
-                $params['PAYMENTREQUEST_0_AMT'] = $basket['AmountWithTaxNumeric'];
+                $params[$prefix . 'AMT'] = $basket['AmountWithTaxNumeric'];
             } else {
-                $params['PAYMENTREQUEST_0_AMT'] = $basket['AmountNumeric'];
+                $params[$prefix . 'AMT'] = $basket['AmountNumeric'];
             }
-            $params['PAYMENTREQUEST_0_AMT'] = $basket['AmountNumeric'];
+            $params[$prefix . 'AMT'] = $basket['AmountNumeric'];
         }
-        $params['PAYMENTREQUEST_0_AMT'] = number_format($params['PAYMENTREQUEST_0_AMT'], 2, '.', '');
-        $params['PAYMENTREQUEST_0_SHIPPINGAMT'] = number_format($params['PAYMENTREQUEST_0_SHIPPINGAMT'], 2, '.', '');
-        $params['PAYMENTREQUEST_0_ITEMAMT'] = number_format($params['PAYMENTREQUEST_0_AMT'] - $params['PAYMENTREQUEST_0_SHIPPINGAMT'], 2, '.', '');
-        $params['PAYMENTREQUEST_0_TAXAMT'] = number_format(0, 2, '.', '');
+        $params[$prefix . 'AMT'] = number_format($params[$prefix . 'AMT'], 2, '.', '');
+        $params[$prefix . 'SHIPPINGAMT'] = number_format($params[$prefix . 'SHIPPINGAMT'], 2, '.', '');
+        $params[$prefix . 'ITEMAMT'] = number_format($params[$prefix . 'AMT'] - $params[$prefix . 'SHIPPINGAMT'], 2, '.', '');
+        $params[$prefix . 'TAXAMT'] = number_format(0, 2, '.', '');
 
         $config = $this->plugin->Config();
-        if ($config->get('paypalTransferCart') && $params['PAYMENTREQUEST_0_ITEMAMT'] != '0.00' && count($basket['content']) < 25) {
+        if ($config->get('paypalTransferCart') && $params[$prefix . 'ITEMAMT'] != '0.00' && count($basket['content']) < 25) {
             foreach ($basket['content'] as $key => $item) {
                 if (!empty($user['additional']['charge_vat']) && !empty($item['amountWithTax'])) {
                     $amount = round($item['amountWithTax'], 2);
@@ -753,9 +711,9 @@ class Shopware_Controllers_Frontend_PaymentPaypal extends Shopware_Controllers_F
             }
         }
 
-        if ($params['PAYMENTREQUEST_0_ITEMAMT'] == '0.00') {
-            $params['PAYMENTREQUEST_0_ITEMAMT'] = $params['PAYMENTREQUEST_0_SHIPPINGAMT'];
-            $params['PAYMENTREQUEST_0_SHIPPINGAMT'] = '0.00';
+        if ($params[$prefix . 'ITEMAMT'] === '0.00') {
+            $params[$prefix . 'ITEMAMT'] = $params[$prefix . 'SHIPPINGAMT'];
+            $params[$prefix . 'SHIPPINGAMT'] = '0.00';
         }
 
         return $params;
@@ -766,7 +724,7 @@ class Shopware_Controllers_Frontend_PaymentPaypal extends Shopware_Controllers_F
      *
      * @return array
      */
-    protected function getCustomerParameter()
+    protected function getCustomerParameter($prefix = '')
     {
         $user = $this->getUser();
         if (empty($user)) {
@@ -793,20 +751,128 @@ class Shopware_Controllers_Frontend_PaymentPaypal extends Shopware_Controllers_F
         $customer = array(
             'CUSTOMERSERVICENUMBER' => $user['billingaddress']['customernumber'],
             //'gender' => $shipping['salutation'] == 'ms' ? 'f' : 'm',
-            'PAYMENTREQUEST_0_SHIPTONAME' => $name,
-            'PAYMENTREQUEST_0_SHIPTOSTREET' => $shipping['street'],
-            'PAYMENTREQUEST_0_SHIPTOSTREET2' => $shipping['street2'],
-            'PAYMENTREQUEST_0_SHIPTOZIP' => $shipping['zipcode'],
-            'PAYMENTREQUEST_0_SHIPTOCITY' => $shipping['city'],
-            'PAYMENTREQUEST_0_SHIPTOCOUNTRYCODE' => $user['additional']['countryShipping']['countryiso'],
+            $prefix . 'NAME' => $name,
+            $prefix . 'STREET' => $shipping['street'],
+            $prefix . 'STREET2' => $shipping['street2'],
+            $prefix . 'ZIP' => $shipping['zipcode'],
+            $prefix . 'CITY' => $shipping['city'],
+            $prefix . 'COUNTRYCODE' => $user['additional']['countryShipping']['countryiso'],
             'EMAIL' => $user['additional']['user']['email'],
-            'PAYMENTREQUEST_0_SHIPTOPHONENUM' => $user['billingaddress']['phone'],
+            $prefix . 'PHONENUM' => $user['billingaddress']['phone'],
             'LOCALECODE' => $this->plugin->getLocaleCode(true)
         );
         if (!empty($user['additional']['stateShipping']['shortcode'])) {
-            $customer['PAYMENTREQUEST_0_SHIPTOSTATE'] = $user['additional']['stateShipping']['shortcode'];
+            $customer[$prefix . 'STATE'] = $user['additional']['stateShipping']['shortcode'];
         }
 
         return $customer;
+    }
+
+    /**
+     * See https://developer.paypal.com/docs/classic/api/merchant/DoReferenceTransaction_API_Operation_NVP/
+     *
+     * @param $details
+     *
+     * @return array
+     */
+    private function getReferenceTransactionParams($details)
+    {
+        $config = $this->plugin->Config();
+
+        $router = $this->Front()->Router();
+        $notifyUrl = $router->assemble(array('action' => 'notify', 'forceSecure' => true, 'appendSession' => true));
+
+        $params = array(
+            'REFERENCEID' => $details['REFERENCEID'],
+            'IPADDRESS' => $this->Request()->getClientIp(false),
+            'NOTIFYURL' => $notifyUrl,
+            'CUSTOM' => $this->createPaymentUniqueId(),
+            'BUTTONSOURCE' => 'Shopware_Cart_ECM'
+        );
+
+        if (Shopware::VERSION === '___VERSION___' || version_compare(Shopware::VERSION, '4.4.0') >= 0) {
+            $params['BUTTONSOURCE'] = 'Shopware_Cart_5';
+        }
+
+        if (empty($params['TOKEN'])) {
+            $params['PAYMENTACTION'] = 'Authorization';
+        } else {
+            $params['PAYMENTACTION'] = $config->get('paypalPaymentAction', 'Sale');
+        }
+
+        if ($config->get('paypalSendInvoiceId')) {
+            $orderNumber = $this->saveOrder(
+                isset($params['TOKEN']) ? $params['TOKEN'] : $params['REFERENCEID'], $params['CUSTOM']
+            );
+
+            $prefix = $config->get('paypalPrefixInvoiceId');
+            if (!empty($prefix)) {
+                // Set prefixed invoice id - Remove special chars and spaces
+                $prefix = str_replace(' ', '', $prefix);
+                $prefix = preg_replace('/[^A-Za-z0-9\-]/', '', $prefix);
+                $params['INVNUM'] = $prefix . $orderNumber;
+            } else {
+                $params['INVNUM'] = $orderNumber;
+            }
+        }
+
+        $params = array_merge($params, $this->getBasketParameter());
+        $params = array_merge($params, $this->getCustomerParameter());
+
+        return $params;
+    }
+
+    /**
+     * See https://developer.paypal.com/docs/classic/api/merchant/DoExpressCheckoutPayment_API_Operation_NVP/
+     *
+     * @param $details
+     *
+     * @return array
+     */
+    private function getExpressCheckoutPaymentParams($details)
+    {
+        $config = $this->plugin->Config();
+
+        $router = $this->Front()->Router();
+        $notifyUrl = $router->assemble(array('action' => 'notify', 'forceSecure' => true, 'appendSession' => true));
+
+        $params = array(
+            'TOKEN' => $details['TOKEN'],
+            'PAYERID' => $details['PAYERID'],
+            'PAYMENTREQUEST_0_NOTIFYURL' => $notifyUrl,
+            'PAYMENTREQUEST_0_CUSTOM' => $details['PAYMENTREQUEST_0_CUSTOM'],
+            'BUTTONSOURCE' => 'Shopware_Cart_ECS'
+        );
+
+        if (Shopware::VERSION === '___VERSION___' || version_compare(Shopware::VERSION, '4.4.0') >= 0) {
+            $params['BUTTONSOURCE'] = 'Shopware_Cart_5';
+        }
+
+        if (empty($params['TOKEN'])) {
+            $params['PAYMENTREQUEST_0_PAYMENTACTION'] = 'Authorization';
+        } else {
+            $params['PAYMENTREQUEST_0_PAYMENTACTION'] = $config->get('paypalPaymentAction', 'Sale');
+        }
+
+        if ($config->get('paypalSendInvoiceId')) {
+            $orderNumber = $this->saveOrder(
+                isset($params['TOKEN']) ? $params['TOKEN'] : $params['REFERENCEID'], $params['PAYMENTREQUEST_0_CUSTOM']
+            );
+
+            $prefix = $config->get('paypalPrefixInvoiceId');
+            if (!empty($prefix)) {
+                // Set prefixed invoice id - Remove special chars and spaces
+                $prefix = str_replace(' ', '', $prefix);
+                $prefix = preg_replace('/[^A-Za-z0-9\-]/', '', $prefix);
+                $params['PAYMENTREQUEST_0_INVNUM'] = $prefix . $orderNumber;
+            } else {
+                $params['PAYMENTREQUEST_0_INVNUM'] = $orderNumber;
+            }
+        }
+
+        $params = array_merge($params, $this->getBasketParameter('PAYMENTREQUEST_0_'));
+        $params = array_merge($params, $this->getCustomerParameter('PAYMENTREQUEST_0_SHIPTO'));
+
+        return $params;
     }
 }
